@@ -4,9 +4,14 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <vector>
+#include <numeric>
+#include <algorithm>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
 #include <dirent.h>
 #include <string.h>
-#include <algorithm>
 #include <regex>
 #include <inttypes.h>
 #include <spdlog/spdlog.h>
@@ -35,6 +40,74 @@
 #endif
 
 #include "file_utils.h"
+
+// 进程 CPU 使用率监控相关变量
+static unsigned long long prev_proc_ticks = 0;
+static std::chrono::steady_clock::time_point prev_time;
+static bool is_first_run = true;
+static long clk_tck = 100;
+static int num_cores = 1;
+
+// 读取当前进程的 CPU 时间 (utime + stime)
+static unsigned long long get_self_cpu_ticks() {
+    std::ifstream file("/proc/self/stat");
+    if (!file.is_open()) return 0;
+
+    std::string line;
+    std::getline(file, line);
+    
+    // /proc/self/stat 格式复杂，第二项 (comm) 可能包含空格和括号
+    size_t last_parenthesis = line.find_last_of(')');
+    if (last_parenthesis == std::string::npos || last_parenthesis + 2 >= line.length()) return 0;
+
+    std::stringstream ss(line.substr(last_parenthesis + 2));
+    
+    std::string val;
+    unsigned long long utime = 0, stime = 0;
+    
+    // 跳过前 11 项
+    for (int i = 0; i < 11; i++) ss >> val;
+    
+    ss >> utime >> stime;
+    return utime + stime;
+}
+
+// 更新进程 CPU 使用率
+static void update_process_usage(CPUData& cpuDataTotal) {
+    unsigned long long cur_ticks = get_self_cpu_ticks();
+    auto cur_time = std::chrono::steady_clock::now();
+
+    if (is_first_run) {
+        clk_tck = sysconf(_SC_CLK_TCK);
+        num_cores = sysconf(_SC_NPROCESSORS_ONLN);
+        if (num_cores < 1) num_cores = 1;
+        if (clk_tck < 1) clk_tck = 100;
+
+        prev_proc_ticks = cur_ticks;
+        prev_time = cur_time;
+        is_first_run = false;
+        return;
+    }
+
+    std::chrono::duration<float> elapsed_seconds = cur_time - prev_time;
+    float dt = elapsed_seconds.count();
+
+    if (dt > 0.0f) {
+        unsigned long long tick_diff = 0;
+        if (cur_ticks > prev_proc_ticks) tick_diff = cur_ticks - prev_proc_ticks;
+
+        float cpu_usage = ((float)tick_diff / (float)clk_tck) / dt * 100.0f;
+        cpu_usage /= (float)num_cores;
+
+        if (cpu_usage > 100.0f) cpu_usage = 100.0f;
+        if (cpu_usage < 0.0f) cpu_usage = 0.0f;
+
+        cpuDataTotal.percent = cpu_usage;
+
+        prev_proc_ticks = cur_ticks;
+        prev_time = cur_time;
+    }
+}
 
 static void calculateCPUData(CPUData& cpuData,
     unsigned long long int usertime,
@@ -119,45 +192,49 @@ bool CPUStats::Init()
     if (m_inited)
         return true;
 
+    // 尝试从 /proc/stat 读取 CPU 核心信息
     std::string line;
     std::ifstream file (PROCSTATFILE);
     bool first = true;
     m_cpuData.clear();
 
-    if (!file.is_open()) {
-        SPDLOG_ERROR("Failed to opening " PROCSTATFILE);
-        return false;
+    if (file.is_open()) {
+        do {
+            if (!std::getline(file, line)) {
+                break;
+            } else if (starts_with(line, "cpu")) {
+                if (first) {
+                    first = false;
+                    continue;
+                }
+
+                CPUData cpu = {};
+                cpu.totalTime = 1;
+                cpu.totalPeriod = 1;
+                sscanf(line.c_str(), "cpu%4d ", &cpu.cpu_id);
+                m_cpuData.push_back(cpu);
+
+            } else if (starts_with(line, "btime ")) {
+                sscanf(line.c_str(), "btime %lld\n", &m_boottime);
+                break;
+            }
+        } while(true);
     }
 
-    do {
-        if (!std::getline(file, line)) {
-            SPDLOG_DEBUG("Failed to read all of " PROCSTATFILE);
-            return false;
-        } else if (starts_with(line, "cpu")) {
-            if (first) {
-                first =false;
-                continue;
-            }
-
+    // 如果 /proc/stat 不可用，创建默认的核心列表
+    if (m_cpuData.empty()) {
+        int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        if (num_cpus < 1) num_cpus = 1;
+        
+        for (int i = 0; i < num_cpus; i++) {
             CPUData cpu = {};
+            cpu.cpu_id = i;
             cpu.totalTime = 1;
             cpu.totalPeriod = 1;
-            sscanf(line.c_str(), "cpu%4d ", &cpu.cpu_id);
             m_cpuData.push_back(cpu);
-
-        } else if (starts_with(line, "btime ")) {
-
-            // C++ way, kind of noisy
-            //std::istringstream token( line );
-            //std::string s;
-            //token >> s;
-            //token >> m_boottime;
-
-            // assume that if btime got read, that everything else is OK too
-            sscanf(line.c_str(), "btime %lld\n", &m_boottime);
-            break;
         }
-    } while(true);
+        SPDLOG_WARN("Could not read /proc/stat, created {} default CPU entries", num_cpus);
+    }
 
 #ifndef TEST_ONLY
     if (get_params()->enabled[OVERLAY_PARAM_ENABLED_core_type])
@@ -177,66 +254,69 @@ bool CPUStats::Reinit()
 //TODO take sampling interval into account?
 bool CPUStats::UpdateCPUData()
 {
+    if (!m_inited)
+        return false;
+
+    // 首先尝试从 /proc/stat 读取
     unsigned long long int usertime, nicetime, systemtime, idletime;
     unsigned long long int ioWait, irq, softIrq, steal, guest, guestnice;
     int cpuid = -1;
     size_t cpu_count = 0;
 
-    if (!m_inited)
-        return false;
-
     std::string line;
     std::ifstream file (PROCSTATFILE);
     bool ret = false;
 
-    if (!file.is_open()) {
-        SPDLOG_ERROR("Failed to opening " PROCSTATFILE);
-        return false;
+    if (file.is_open()) {
+        do {
+            if (!std::getline(file, line)) {
+                break;
+            } else if (!ret && sscanf(line.c_str(), "cpu  %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu",
+                &usertime, &nicetime, &systemtime, &idletime, &ioWait, &irq, &softIrq, &steal, &guest, &guestnice) == 10) {
+                ret = true;
+                calculateCPUData(m_cpuDataTotal, usertime, nicetime, systemtime, idletime, ioWait, irq, softIrq, steal, guest, guestnice);
+            } else if (sscanf(line.c_str(), "cpu%4d %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu",
+                &cpuid, &usertime, &nicetime, &systemtime, &idletime, &ioWait, &irq, &softIrq, &steal, &guest, &guestnice) == 11) {
+
+                if (!ret) {
+                    SPDLOG_DEBUG("Failed to parse 'cpu' line:{}", line);
+                    break;
+                }
+
+                if (cpuid < 0) {
+                    SPDLOG_DEBUG("Cpu id '{}' is out of bounds", cpuid);
+                    break;
+                }
+
+                if (cpu_count + 1 > m_cpuData.size() || m_cpuData[cpu_count].cpu_id != cpuid) {
+                    SPDLOG_DEBUG("Cpu id '{}' is out of bounds or wrong index, reiniting", cpuid);
+                    return Reinit();
+                }
+
+                CPUData& cpuData = m_cpuData[cpu_count];
+                calculateCPUData(cpuData, usertime, nicetime, systemtime, idletime, ioWait, irq, softIrq, steal, guest, guestnice);
+                cpuid = -1;
+                cpu_count++;
+
+            } else {
+                break;
+            }
+        } while(true);
+
+        if (ret && cpu_count < m_cpuData.size())
+            m_cpuData.resize(cpu_count);
     }
 
-    do {
-        if (!std::getline(file, line)) {
-            break;
-        } else if (!ret && sscanf(line.c_str(), "cpu  %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu",
-            &usertime, &nicetime, &systemtime, &idletime, &ioWait, &irq, &softIrq, &steal, &guest, &guestnice) == 10) {
-            ret = true;
-            calculateCPUData(m_cpuDataTotal, usertime, nicetime, systemtime, idletime, ioWait, irq, softIrq, steal, guest, guestnice);
-        } else if (sscanf(line.c_str(), "cpu%4d %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu %16llu",
-            &cpuid, &usertime, &nicetime, &systemtime, &idletime, &ioWait, &irq, &softIrq, &steal, &guest, &guestnice) == 11) {
+    // 如果 /proc/stat 不可用，使用进程 CPU 监控
+    if (!ret) {
+        update_process_usage(m_cpuDataTotal);
+        SPDLOG_DEBUG("Using process CPU monitoring: {:.1f}%", m_cpuDataTotal.percent);
+    } else {
+        m_cpuPeriod = (double)m_cpuData[0].totalPeriod / m_cpuData.size();
+    }
 
-            //SPDLOG_DEBUG("Parsing 'cpu{}' line:{}", cpuid, line);
-
-            if (!ret) {
-                SPDLOG_DEBUG("Failed to parse 'cpu' line:{}", line);
-                return false;
-            }
-
-            if (cpuid < 0 /* can it? */) {
-                SPDLOG_DEBUG("Cpu id '{}' is out of bounds", cpuid);
-                return false;
-            }
-
-            if (cpu_count + 1 > m_cpuData.size() || m_cpuData[cpu_count].cpu_id != cpuid) {
-                SPDLOG_DEBUG("Cpu id '{}' is out of bounds or wrong index, reiniting", cpuid);
-                return Reinit();
-            }
-
-            CPUData& cpuData = m_cpuData[cpu_count];
-            calculateCPUData(cpuData, usertime, nicetime, systemtime, idletime, ioWait, irq, softIrq, steal, guest, guestnice);
-            cpuid = -1;
-            cpu_count++;
-
-        } else {
-            break;
-        }
-    } while(true);
-
-    if (cpu_count < m_cpuData.size())
-        m_cpuData.resize(cpu_count);
-
-    m_cpuPeriod = (double)m_cpuData[0].totalPeriod / m_cpuData.size();
     m_updatedCPUs = true;
-    return ret;
+    return true; // 总是返回 true，因为我们有备用方案
 }
 
 bool CPUStats::UpdateCoreMhz() {

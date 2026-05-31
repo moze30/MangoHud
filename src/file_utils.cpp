@@ -42,9 +42,14 @@ std::vector<std::string> ls(const char* root, const char* prefix, LS_FLAGS flags
     std::vector<std::string> list;
     struct dirent* dp;
 
+    // 在 Android Proot 环境下，直接 opendir 受限目录可能会崩，先检查权限
+    if (access(root, R_OK | X_OK) != 0) {
+        return list; // 如果没权限，直接返回空列表
+    }
+
     DIR* dirp = opendir(root);
     if (!dirp) {
-        SPDLOG_ERROR("Error opening directory '{}': {}", root, strerror(errno));
+        //SPDLOG_ERROR("Error opening directory '{}': {}", root, strerror(errno));
         return list;
     }
 

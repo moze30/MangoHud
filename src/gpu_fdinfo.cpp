@@ -551,7 +551,24 @@ int GPU_fdinfo::get_gpu_clock()
     if (clock_str.empty())
         return 0;
 
-    return std::stoi(clock_str);
+    try {
+        double freq = std::stod(clock_str);
+        
+        // 处理不同单位的频率值
+        // 如果值大于 1e7，认为是 Hz 单位，转换为 MHz
+        if (freq > 1e7) {
+            freq = freq / 1e6;
+        }
+        // 如果值大于 1e4，认为是 KHz 单位，转换为 MHz
+        else if (freq > 1e4) {
+            freq = freq / 1e3;
+        }
+        // 否则认为已经是 MHz 单位
+        
+        return std::round(freq);
+    } catch (...) {
+        return 0;
+    }
 }
 
 int GPU_fdinfo::get_gpu_clock_mali() {
@@ -644,62 +661,213 @@ void GPU_fdinfo::init_kgsl() {
             SPDLOG_WARN("kgsl: {} is not found. kgsl stats will not work!", sys_path);
             return;
         }
-    } catch (fs::filesystem_error& ex) {
+    } catch (const fs::filesystem_error& ex) {
         SPDLOG_WARN("kgsl: {}", ex.what());
+        return;
+    } catch (const std::exception& ex) {
+        SPDLOG_WARN("kgsl: Error checking sys_path: {}", ex.what());
         return;
     }
 
-    for (std::string metric : {"gpu_busy_percentage", "temp", "clock_mhz" }) {
-        std::string p = sys_path + "/" + metric;
+    try {
+        // 尝试多个 GPU 频率路径
+        const char* freq_paths[] = {
+            "/sys/kernel/gpu/gpu_clock",
+            "/sys/class/kgsl/kgsl-3d0/gpuclk",
+            "/sys/class/kgsl/kgsl-3d0/cur_freq",
+            "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+            nullptr
+        };
 
-        if (!fs::exists(p)) {
-            SPDLOG_WARN("kgsl: {} is not found", p);
-            continue;
+        for (int i = 0; freq_paths[i]; i++) {
+            try {
+                if (fs::exists(freq_paths[i])) {
+                    SPDLOG_DEBUG("kgsl: GPU freq path found: {}", freq_paths[i]);
+                    gpu_clock_stream.open(freq_paths[i]);
+                    if (gpu_clock_stream.is_open())
+                        break;
+                }
+            } catch (...) {
+                // 继续尝试下一个路径
+            }
         }
 
-        SPDLOG_DEBUG("kgsl: {} found", p);
+        // 如果上述路径都失败，尝试 clock_mhz
+        if (!gpu_clock_stream.is_open()) {
+            std::string clock_path = sys_path + "/clock_mhz";
+            try {
+                if (fs::exists(clock_path)) {
+                    SPDLOG_DEBUG("kgsl: {} found", clock_path);
+                    gpu_clock_stream.open(clock_path);
+                }
+            } catch (...) {
+                // 忽略错误
+            }
+        }
 
-        if (metric == "clock_mhz")
-            gpu_clock_stream.open(p);
-        else
-            kgsl_streams[metric].open(p);
+        // 尝试多个 GPU 使用率路径
+        const char* load_paths[] = {
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+            "/sys/kernel/gpu/gpu_busy",
+            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
+            "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
+            nullptr
+        };
+
+        for (int i = 0; load_paths[i]; i++) {
+            try {
+                if (fs::exists(load_paths[i])) {
+                    SPDLOG_DEBUG("kgsl: GPU load path found: {}", load_paths[i]);
+                    kgsl_streams["gpu_busy_percentage"].open(load_paths[i]);
+                    if (kgsl_streams["gpu_busy_percentage"].is_open())
+                        break;
+                }
+            } catch (...) {
+                // 继续尝试下一个路径
+            }
+        }
+
+        // 尝试 gpubusy 文件（返回 "busy_time total_time"）
+        std::string gpubusy_path = sys_path + "/gpubusy";
+        try {
+            if (fs::exists(gpubusy_path)) {
+                SPDLOG_DEBUG("kgsl: gpubusy path found: {}", gpubusy_path);
+                kgsl_streams["gpubusy"].open(gpubusy_path);
+            }
+        } catch (...) {
+            // 忽略错误
+        }
+
+        // 温度路径
+        std::string temp_path = sys_path + "/temp";
+        try {
+            if (fs::exists(temp_path)) {
+                SPDLOG_DEBUG("kgsl: {} found", temp_path);
+                kgsl_streams["temp"].open(temp_path);
+            }
+        } catch (...) {
+            // 忽略错误
+        }
+    } catch (const std::exception& ex) {
+        SPDLOG_WARN("kgsl: Error during initialization: {}", ex.what());
     }
 }
 
 int GPU_fdinfo::get_kgsl_load() {
+    // 首先尝试 gpu_busy_percentage 文件
     std::ifstream* s = &kgsl_streams["gpu_busy_percentage"];
 
-    if (!s->is_open())
-        return 0;
+    if (s->is_open()) {
+        std::string usage_str;
+        s->seekg(0);
+        std::getline(*s, usage_str);
 
-    std::string usage_str;
+        if (!usage_str.empty()) {
+            try {
+                return std::stoi(usage_str);
+            } catch (...) {
+                // 解析失败，继续尝试其他方法
+            }
+        }
+    }
 
-    s->seekg(0);
+    // 尝试 gpubusy 文件（返回 "busy_time total_time"）
+    std::ifstream* busy_s = &kgsl_streams["gpubusy"];
 
-    std::getline(*s, usage_str);
+    if (busy_s->is_open()) {
+        std::string busy_str;
+        busy_s->seekg(0);
+        std::getline(*busy_s, busy_str);
 
-    if (usage_str.empty())
-        return 0;
+        if (!busy_str.empty()) {
+            std::istringstream iss(busy_str);
+            double busy_time = 0, total_time = 0;
+            if (iss >> busy_time >> total_time) {
+                if (total_time > 0) {
+                    return static_cast<int>(busy_time / total_time * 100.0);
+                } else {
+                    return 0; // GPU 空闲
+                }
+            }
+        }
+    }
 
-    return std::stoi(usage_str);
+    return 0;
 }
 
 int GPU_fdinfo::get_kgsl_temp() {
+    // 首先尝试 kgsl 温度文件
     std::ifstream* s = &kgsl_streams["temp"];
 
-    if (!s->is_open())
-        return 0;
+    if (s->is_open()) {
+        std::string temp_str;
+        s->seekg(0);
+        std::getline(*s, temp_str);
 
-    std::string temp_str;
+        if (!temp_str.empty()) {
+            try {
+                return std::round(std::stoi(temp_str) / 1'000.f);
+            } catch (...) {
+                // 解析失败，继续尝试其他方法
+            }
+        }
+    }
 
-    s->seekg(0);
+    // 尝试从 thermal zones 查找 GPU 温度
+    static int cached_gpu_thermal_zone = -1;
+    static bool thermal_zone_searched = false;
 
-    std::getline(*s, temp_str);
+    if (!thermal_zone_searched) {
+        thermal_zone_searched = true;
+        std::string sysfs_thermal = "/sys/class/thermal/";
 
-    if (temp_str.empty())
-        return 0;
+        if (fs::exists(sysfs_thermal)) {
+            for (const auto& entry : fs::directory_iterator(sysfs_thermal)) {
+                std::string filename = entry.path().filename().string();
+                if (filename.substr(0, 12) != "thermal_zone")
+                    continue;
 
-    return std::round(std::stoi(temp_str) / 1'000.f);
+                std::string type_file = entry.path().string() + "/type";
+                std::ifstream type_stream(type_file);
+                std::string type;
+
+                if (type_stream.is_open() && std::getline(type_stream, type)) {
+                    // 查找包含 "gpuss" 的 thermal zone
+                    if (type.find("gpuss") != std::string::npos) {
+                        // 提取 thermal zone 编号
+                        try {
+                            cached_gpu_thermal_zone = std::stoi(filename.substr(12));
+                            SPDLOG_DEBUG("Found GPU thermal zone: {} with type: {}", filename, type);
+                            break;
+                        } catch (...) {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (cached_gpu_thermal_zone >= 0) {
+        std::string temp_file = "/sys/class/thermal/thermal_zone" + 
+                               std::to_string(cached_gpu_thermal_zone) + "/temp";
+        std::ifstream temp_stream(temp_file);
+        std::string temp_str;
+
+        if (temp_stream.is_open() && std::getline(temp_stream, temp_str)) {
+            try {
+                double temp = std::stod(temp_str);
+                // 温度通常是毫度，需要除以 1000
+                if (temp > 1000)
+                    temp /= 1000.0;
+                return std::round(temp);
+            } catch (...) {
+                // 解析失败
+            }
+        }
+    }
+
+    return 0;
 }
 
 void GPU_fdinfo::main_thread()
@@ -737,10 +905,14 @@ void GPU_fdinfo::main_thread()
         metrics.CoreClock = get_gpu_clock();
         metrics.voltage = hwmon_sensors["voltage"].val;
 
-        if (module == "msm_drm")
+        if (module == "msm_drm" || module == "msm_dpu") {
             metrics.temp = get_kgsl_temp();
-        else
+            // 如果 kgsl 温度不可用，尝试 hwmon
+            if (metrics.temp == 0 && hwmon_sensors["temp"].val > 0)
+                metrics.temp = hwmon_sensors["temp"].val / 1000.f;
+        } else {
             metrics.temp = hwmon_sensors["temp"].val / 1000.f;
+        }
 
         metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
 

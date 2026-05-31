@@ -1,6 +1,12 @@
 #include "gpu.h"
 #include "file_utils.h"
 #include "hud_elements.h"
+#include "overlay_params.h"
+#include <fstream>
+#include <algorithm>
+#include <iostream>
+#include <thread>
+#include <chrono>
 
 namespace fs = ghc::filesystem;
 
@@ -8,20 +14,28 @@ GPUS::GPUS(const overlay_params* early_params) {
     std::set<std::string> gpu_entries;
     auto params = early_params ? early_params : get_params().get();
 
-    for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
-        if (!entry.is_directory())
-            continue;
+    try {
+        if (fs::exists("/sys/class/drm")) {
+            for (const auto& entry : fs::directory_iterator("/sys/class/drm")) {
+                if (!entry.is_directory())
+                    continue;
 
-        std::string node_name = entry.path().filename().string();
+                std::string node_name = entry.path().filename().string();
 
-        // Check if the directory is a render node (e.g., renderD128, renderD129, etc.)
-        if (node_name.find("renderD") == 0 && node_name.length() > 7) {
-            // Ensure the rest of the string after "renderD" is numeric
-            std::string render_number = node_name.substr(7);
-            if (std::all_of(render_number.begin(), render_number.end(), ::isdigit)) {
-                gpu_entries.insert(node_name);  // Store the render entry
+                // Check if the directory is a render node (e.g., renderD128, renderD129, etc.)
+                if (node_name.find("renderD") == 0 && node_name.length() > 7) {
+                    // Ensure the rest of the string after "renderD" is numeric
+                    std::string render_number = node_name.substr(7);
+                    if (std::all_of(render_number.begin(), render_number.end(), ::isdigit)) {
+                        gpu_entries.insert(node_name);  // Store the render entry
+                    }
+                }
             }
         }
+    } catch (const fs::filesystem_error& ex) {
+        SPDLOG_WARN("Failed to access /sys/class/drm: {}. GPU detection disabled.", ex.what());
+    } catch (const std::exception& ex) {
+        SPDLOG_WARN("Error during GPU detection: {}. GPU detection disabled.", ex.what());
     }
 
     // Now process the sorted GPU entries
@@ -95,6 +109,87 @@ GPUS::GPUS(const overlay_params* early_params) {
         }
     }
 
+    // 注入 Adreno GPU（如果 kgsl 存在但 drm 没有检测到）
+    if (fs::exists("/sys/class/kgsl/kgsl-3d0/gpubusy")) {
+        bool already_added = false;
+        for (auto& g : available_gpus) {
+            if (g->driver == "adreno" || g->driver == "freedreno" || 
+                g->driver == "msm_drm" || g->driver == "msm_dpu") {
+                already_added = true;
+                break;
+            }
+        }
+
+        if (!already_added) {
+            auto adreno = std::make_shared<GPU>("Adreno", 0x5143, 0, "0000:00:00.0", "adreno");
+            
+            if (total_active == 0) {
+                adreno->is_active = true;
+                total_active++;
+            }
+            available_gpus.emplace_back(adreno);
+
+            // 启动后台线程监控 GPU 使用率
+            std::thread([adreno](){
+                while(true) {
+                    std::ifstream stream("/sys/class/kgsl/kgsl-3d0/gpubusy");
+                    if (stream.is_open()) {
+                        std::string line;
+                        if (std::getline(stream, line)) {
+                            long long used = 0, total = 0;
+                            if (sscanf(line.c_str(), "%lld %lld", &used, &total) == 2 && total > 0) {
+                                 int val = (int)((float)used / total * 100);
+                                 if (val > 100) val = 100;
+                                 if (val < 0) val = 0;
+                                 adreno->metrics.load = val;
+                            }
+                        }
+                    }
+                    
+                    // 读取 GPU 温度
+                    std::ifstream temp_stream("/sys/class/kgsl/kgsl-3d0/temp");
+                    if (temp_stream.is_open()) {
+                        std::string temp_str;
+                        if (std::getline(temp_stream, temp_str)) {
+                            try {
+                                int temp = std::stoi(temp_str);
+                                if (temp > 1000) temp /= 1000; // 毫度转度
+                                adreno->metrics.temp = temp;
+                            } catch (...) {}
+                        }
+                    }
+                    
+                    // 读取 GPU 频率
+                    const char* freq_paths[] = {
+                        "/sys/class/kgsl/kgsl-3d0/gpuclk",
+                        "/sys/class/kgsl/kgsl-3d0/cur_freq",
+                        "/sys/kernel/gpu/gpu_clock",
+                        nullptr
+                    };
+                    for (int i = 0; freq_paths[i]; i++) {
+                        std::ifstream freq_stream(freq_paths[i]);
+                        if (freq_stream.is_open()) {
+                            std::string freq_str;
+                            if (std::getline(freq_stream, freq_str)) {
+                                try {
+                                    double freq = std::stod(freq_str);
+                                    if (freq > 1e7) freq /= 1e6; // Hz -> MHz
+                                    else if (freq > 1e4) freq /= 1e3; // KHz -> MHz
+                                    adreno->metrics.CoreClock = (int)freq;
+                                    break;
+                                } catch (...) {}
+                            }
+                        }
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                }
+            }).detach();
+
+            SPDLOG_INFO("Adreno GPU injected with background monitoring thread");
+        }
+    }
+
     if (total_active < 2)
         return;
 
@@ -115,40 +210,56 @@ GPUS::GPUS(const overlay_params* early_params) {
 }
 
 std::string GPUS::get_driver(const std::string& node) {
-    std::string path = "/sys/class/drm/" + node + "/device/driver";
+    try {
+        std::string path = "/sys/class/drm/" + node + "/device/driver";
 
-    if (!fs::exists(path)) {
-        SPDLOG_ERROR("{} doesn't exist", path);
+        if (!fs::exists(path)) {
+            SPDLOG_ERROR("{} doesn't exist", path);
+            return "";
+        }
+
+        if (!fs::is_symlink(path)) {
+            SPDLOG_ERROR("{} is not a symlink (it should be)", path);
+            return "";
+        }
+
+        std::string driver = fs::read_symlink(path).string();
+        driver = driver.substr(driver.rfind("/") + 1);
+
+        return driver;
+    } catch (const fs::filesystem_error& ex) {
+        SPDLOG_ERROR("filesystem_error in get_driver: {}", ex.what());
+        return "";
+    } catch (const std::exception& ex) {
+        SPDLOG_ERROR("Error in get_driver: {}", ex.what());
         return "";
     }
-
-    if (!fs::is_symlink(path)) {
-        SPDLOG_ERROR("{} is not a symlink (it should be)", path);
-        return "";
-    }
-
-    std::string driver = fs::read_symlink(path).string();
-    driver = driver.substr(driver.rfind("/") + 1);
-
-    return driver;
 }
 
 std::string GPUS::get_pci_device_address(const std::string& drm_card_path) {
-    // /sys/class/drm/renderD128/device/subsystem -> /sys/bus/pci
-    auto subsystem = fs::canonical(drm_card_path + "/device/subsystem").string();
-    auto idx = subsystem.rfind("/") + 1; // /sys/bus/pci
-                                         //         ^
-                                         //         |- find this guy
-    if (subsystem.substr(idx) != "pci")
+    try {
+        // /sys/class/drm/renderD128/device/subsystem -> /sys/bus/pci
+        auto subsystem = fs::canonical(drm_card_path + "/device/subsystem").string();
+        auto idx = subsystem.rfind("/") + 1; // /sys/bus/pci
+                                             //         ^
+                                             //         |- find this guy
+        if (subsystem.substr(idx) != "pci")
+            return "";
+
+        // /sys/class/drm/renderD128/device -> /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:01.0/0000:03:00.0
+        auto pci_addr = fs::read_symlink(drm_card_path + "/device").string();
+        idx = pci_addr.rfind("/") + 1; // /sys/.../0000:03:00.0
+                                       //         ^
+                                       //         |- find this guy
+
+        return pci_addr.substr(idx); // 0000:03:00.0
+    } catch (const fs::filesystem_error& ex) {
+        SPDLOG_DEBUG("filesystem_error in get_pci_device_address: {}", ex.what());
         return "";
-
-    // /sys/class/drm/renderD128/device -> /sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:01.0/0000:03:00.0
-    auto pci_addr = fs::read_symlink(drm_card_path + "/device").string();
-    idx = pci_addr.rfind("/") + 1; // /sys/.../0000:03:00.0
-                                   //         ^
-                                   //         |- find this guy
-
-    return pci_addr.substr(idx); // 0000:03:00.0
+    } catch (const std::exception& ex) {
+        SPDLOG_DEBUG("Error in get_pci_device_address: {}", ex.what());
+        return "";
+    }
 }
 
 int GPU::index_in_selected_gpus() {
