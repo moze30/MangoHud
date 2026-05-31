@@ -289,7 +289,10 @@ void HudElements::gpu_stats(){
 
             ImguiNextColumnOrNewRow();
             auto text_color = HUDElements.colors.text;
-            if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_load_change]){
+            if (gpu->metrics.load < 0) {
+                // GPU 负载数据不可用，显示 N/A
+                right_aligned_text(text_color, HUDElements.ralign_width, "N/A");
+            } else if (HUDElements.params->enabled[OVERLAY_PARAM_ENABLED_gpu_load_change]){
                 struct LOAD_DATA gpu_data = {
                     HUDElements.colors.gpu_load_low,
                     HUDElements.colors.gpu_load_med,

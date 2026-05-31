@@ -109,8 +109,8 @@ GPUS::GPUS(const overlay_params* early_params) {
         }
     }
 
-    // 注入 Adreno GPU（如果 kgsl 存在但 drm 没有检测到）
-    if (fs::exists("/sys/class/kgsl/kgsl-3d0/gpubusy")) {
+    // 注入 Adreno GPU（如果 drm 没有检测到任何 GPU）
+    {
         bool already_added = false;
         for (auto& g : available_gpus) {
             if (g->driver == "adreno" || g->driver == "freedreno" || 
@@ -142,8 +142,14 @@ GPUS::GPUS(const overlay_params* early_params) {
                                  if (val > 100) val = 100;
                                  if (val < 0) val = 0;
                                  adreno->metrics.load = val;
+                            } else {
+                                 adreno->metrics.load = -1; // 解析失败，标记为 N/A
                             }
+                        } else {
+                            adreno->metrics.load = -1; // 读取失败，标记为 N/A
                         }
+                    } else {
+                        adreno->metrics.load = -1; // 文件无法打开，标记为 N/A
                     }
                     
                     // 读取 GPU 温度
