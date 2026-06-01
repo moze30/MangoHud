@@ -48,6 +48,79 @@ static bool is_first_run = true;
 static long clk_tck = 100;
 static int num_cores = 1;
 
+// time_in_state 相关结构和函数（用于估算各核心活跃度）
+struct TimeInState {
+    std::vector<std::pair<double, unsigned long long>> entries;
+};
+
+static std::vector<TimeInState> prev_tis;
+static std::vector<double> max_freqs_khz;
+static bool tis_initialized = false;
+
+static bool read_time_in_state(int core, TimeInState& tis) {
+    std::string p = "/sys/devices/system/cpu/cpu" +
+                    std::to_string(core) + "/cpufreq/stats/time_in_state";
+    std::ifstream f(p);
+    if (!f.is_open()) return false;
+    double freq;
+    unsigned long long time;
+    while (f >> freq >> time)
+        tis.entries.push_back({freq, time});
+    return !tis.entries.empty();
+}
+
+static double read_cpu_max_freq_khz(int core) {
+    std::string p = "/sys/devices/system/cpu/cpu" +
+                    std::to_string(core) + "/cpufreq/cpuinfo_max_freq";
+    std::ifstream f(p);
+    if (!f.is_open()) return 0;
+    double khz;
+    f >> khz;
+    return khz;
+}
+
+static double estimate_core_activity(const TimeInState& prev,
+                                      const TimeInState& curr,
+                                      double max_freq_khz) {
+    if (prev.entries.size() != curr.entries.size()) return -1;
+    if (max_freq_khz <= 0) return -1;
+    unsigned long long total_delta = 0;
+    double weighted_freq = 0;
+    for (size_t i = 0; i < curr.entries.size(); i++) {
+        unsigned long long delta = curr.entries[i].second - prev.entries[i].second;
+        total_delta += delta;
+        weighted_freq += curr.entries[i].first * delta;
+    }
+    if (total_delta == 0) return 0;
+    weighted_freq /= total_delta;
+    return (weighted_freq / max_freq_khz) * 100.0;
+}
+
+static void init_time_in_state(int num_cpus) {
+    prev_tis.resize(num_cpus);
+    max_freqs_khz.resize(num_cpus);
+    for (int i = 0; i < num_cpus; i++) {
+        max_freqs_khz[i] = read_cpu_max_freq_khz(i);
+        read_time_in_state(i, prev_tis[i]);
+    }
+    tis_initialized = true;
+}
+
+static void update_core_usage_from_tis(std::vector<CPUData>& cpuData) {
+    if (!tis_initialized) return;
+    
+    for (size_t i = 0; i < cpuData.size() && i < prev_tis.size(); i++) {
+        TimeInState curr;
+        if (read_time_in_state(i, curr)) {
+            double activity = estimate_core_activity(prev_tis[i], curr, max_freqs_khz[i]);
+            if (activity >= 0) {
+                cpuData[i].percent = (float)activity;
+            }
+            prev_tis[i] = curr;
+        }
+    }
+}
+
 // 读取当前进程的 CPU 时间 (utime + stime)
 static unsigned long long get_self_cpu_ticks() {
     std::ifstream file("/proc/self/stat");
@@ -82,6 +155,9 @@ static void update_process_usage(CPUData& cpuDataTotal) {
         num_cores = sysconf(_SC_NPROCESSORS_ONLN);
         if (num_cores < 1) num_cores = 1;
         if (clk_tck < 1) clk_tck = 100;
+
+        // 初始化 time_in_state
+        init_time_in_state(num_cores);
 
         prev_proc_ticks = cur_ticks;
         prev_time = cur_time;
@@ -310,6 +386,8 @@ bool CPUStats::UpdateCPUData()
     // 如果 /proc/stat 不可用，使用进程 CPU 监控
     if (!ret) {
         update_process_usage(m_cpuDataTotal);
+        // 使用 time_in_state 更新各核心占用率
+        update_core_usage_from_tis(m_cpuData);
         SPDLOG_DEBUG("Using process CPU monitoring: {:.1f}%", m_cpuDataTotal.percent);
     } else {
         m_cpuPeriod = (double)m_cpuData[0].totalPeriod / m_cpuData.size();
