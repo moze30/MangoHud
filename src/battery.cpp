@@ -9,13 +9,19 @@ void BatteryStats::numBattery() {
     int batteryCount = 0;
     if (!fs::exists("/sys/class/power_supply/")) {
          batteryCount = 0;
+         batt_count = 0;
+         batt_check = true;
+         return;
     }
     fs::path path("/sys/class/power_supply/");
     for (auto& p : fs::directory_iterator(path)) {
         string fileName = p.path().filename();
-        if (fileName.find("BAT") != std::string::npos) {
+        // 支持 BAT0, BAT1, battery (Android) 等路径
+        if (fileName.find("BAT") != std::string::npos ||
+            fileName == "battery") {
             battPath[batteryCount] = p.path();
             batteryCount += 1;
+            if (batteryCount >= 2) break; // 最多支持2个电池
         }
     }
     batt_count = batteryCount;
@@ -106,10 +112,13 @@ float BatteryStats::getPower() {
             }
         }
 
+        // Android 设备通常不检查充电状态，始终显示功耗
+        // 因为 Android 上 "Charging" 状态也可能需要监控功耗
+        #ifndef __ANDROID__
         if (state[i] == "Charging" || state[i] == "Unknown" || state[i] == "Full") {
-            // TODO if we have multiple batteries, we will return 0 if just one of them is charging
             return 0.0f;
         }
+        #endif
 
         // Prefer power_now (µW) when available.
         if (fs::exists(power_now)) {
