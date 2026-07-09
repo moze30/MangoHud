@@ -130,65 +130,151 @@ GPUS::GPUS(const overlay_params* early_params) {
             available_gpus.emplace_back(adreno);
 
             // 启动后台线程监控 GPU 使用率
-            std::thread([adreno](){
-                while(true) {
-                    std::ifstream stream("/sys/class/kgsl/kgsl-3d0/gpubusy");
-                    if (stream.is_open()) {
-                        std::string line;
-                        if (std::getline(stream, line)) {
-                            long long used = 0, total = 0;
-                            if (sscanf(line.c_str(), "%lld %lld", &used, &total) == 2 && total > 0) {
-                                 int val = (int)((float)used / total * 100);
-                                 if (val > 100) val = 100;
-                                 if (val < 0) val = 0;
-                                 adreno->metrics.load = val;
-                            } else {
-                                 adreno->metrics.load = -1; // 解析失败，标记为 N/A
+            // 使用持久文件流 + weak_ptr，避免频繁 open/close 和线程泄漏
+            std::thread([weak = std::weak_ptr<GPU>(adreno)](){
+                std::ifstream load_stream;
+                std::ifstream temp_stream;
+                std::ifstream freq_stream;
+                int thermal_zone = -1;
+                bool use_gpubusy = false;
+                bool initialized = false;
+
+                while (true) {
+                    auto gpu = weak.lock();
+                    if (!gpu)
+                        return; // GPU 对象已销毁，退出线程
+
+                    if (!initialized) {
+                        initialized = true;
+
+                        // 尝试 gpu_busy_percentage（直接返回百分比）
+                        load_stream.open("/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage");
+                        if (!load_stream.is_open())
+                            load_stream.open("/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load");
+
+                        // 尝试 gpubusy（格式: "busy_time total_time"）
+                        if (!load_stream.is_open()) {
+                            load_stream.open("/sys/class/kgsl/kgsl-3d0/gpubusy");
+                            if (load_stream.is_open())
+                                use_gpubusy = true;
+                        }
+
+                        // load 流无法打开 → 标记 N/A（仅初始化时）
+                        if (!load_stream.is_open())
+                            gpu->metrics.load = -1;
+
+                        // 温度
+                        temp_stream.open("/sys/class/kgsl/kgsl-3d0/temp");
+                        if (!temp_stream.is_open()) {
+                            // 回退: 搜索 thermal_zone 中含 "gpuss" 的区域
+                            for (int i = 0; i < 20; i++) {
+                                std::string type_path = "/sys/class/thermal/thermal_zone" + std::to_string(i) + "/type";
+                                std::ifstream type_stream(type_path);
+                                std::string type;
+                                if (type_stream.is_open() && std::getline(type_stream, type)) {
+                                    if (type.find("gpuss") != std::string::npos) {
+                                        thermal_zone = i;
+                                        break;
+                                    }
+                                }
                             }
-                        } else {
-                            adreno->metrics.load = -1; // 读取失败，标记为 N/A
                         }
-                    } else {
-                        adreno->metrics.load = -1; // 文件无法打开，标记为 N/A
-                    }
-                    
-                    // 读取 GPU 温度
-                    std::ifstream temp_stream("/sys/class/kgsl/kgsl-3d0/temp");
-                    if (temp_stream.is_open()) {
-                        std::string temp_str;
-                        if (std::getline(temp_stream, temp_str)) {
-                            try {
-                                int temp = std::stoi(temp_str);
-                                if (temp > 1000) temp /= 1000; // 毫度转度
-                                adreno->metrics.temp = temp;
-                            } catch (...) {}
+
+                        // 频率
+                        const char* freq_paths[] = {
+                            "/sys/class/kgsl/kgsl-3d0/gpuclk",
+                            "/sys/class/kgsl/kgsl-3d0/cur_freq",
+                            "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
+                            "/sys/kernel/gpu/gpu_clock",
+                            nullptr
+                        };
+                        for (int i = 0; freq_paths[i]; i++) {
+                            freq_stream.open(freq_paths[i]);
+                            if (freq_stream.is_open())
+                                break;
+                        }
+
+                        // 所有路径都不可用 → 退避 5 秒后重试（A8xx 场景）
+                        if (!load_stream.is_open() && !temp_stream.is_open() &&
+                            !freq_stream.is_open() && thermal_zone < 0) {
+                            SPDLOG_WARN("Adreno: KGSL sysfs 路径不可用，5 秒后重试");
+                            std::this_thread::sleep_for(std::chrono::seconds(5));
+                            load_stream.close();
+                            temp_stream.close();
+                            freq_stream.close();
+                            thermal_zone = -1;
+                            use_gpubusy = false;
+                            initialized = false;
+                            continue;
                         }
                     }
-                    
-                    // 读取 GPU 频率
-                    const char* freq_paths[] = {
-                        "/sys/class/kgsl/kgsl-3d0/gpuclk",
-                        "/sys/class/kgsl/kgsl-3d0/cur_freq",
-                        "/sys/kernel/gpu/gpu_clock",
-                        nullptr
-                    };
-                    for (int i = 0; freq_paths[i]; i++) {
-                        std::ifstream freq_stream(freq_paths[i]);
-                        if (freq_stream.is_open()) {
-                            std::string freq_str;
-                            if (std::getline(freq_stream, freq_str)) {
+
+                    // 读取 GPU 占用率
+                    if (load_stream.is_open()) {
+                        load_stream.clear();
+                        load_stream.seekg(0);
+                        std::string line;
+                        if (std::getline(load_stream, line) && !line.empty()) {
+                            if (use_gpubusy) {
+                                long long used = 0, total = 0;
+                                if (sscanf(line.c_str(), "%lld %lld", &used, &total) == 2 && total > 0) {
+                                    int val = (int)((float)used / total * 100);
+                                    if (val > 100) val = 100;
+                                    if (val < 0) val = 0;
+                                    gpu->metrics.load = val;
+                                }
+                            } else {
                                 try {
-                                    double freq = std::stod(freq_str);
-                                    if (freq > 1e7) freq /= 1e6; // Hz -> MHz
-                                    else if (freq > 1e4) freq /= 1e3; // KHz -> MHz
-                                    adreno->metrics.CoreClock = (int)freq;
-                                    break;
+                                    int val = std::stoi(line);
+                                    if (val >= 0 && val <= 100)
+                                        gpu->metrics.load = val;
                                 } catch (...) {}
                             }
                         }
+                        // 瞬态读取失败时保留上一个有效值，不设 -1（修复 A7xx N/A 跳变）
                     }
-                    
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+                    // 读取 GPU 温度
+                    if (temp_stream.is_open()) {
+                        temp_stream.clear();
+                        temp_stream.seekg(0);
+                        std::string temp_str;
+                        if (std::getline(temp_stream, temp_str) && !temp_str.empty()) {
+                            try {
+                                int temp = std::stoi(temp_str);
+                                if (temp > 1000) temp /= 1000;
+                                gpu->metrics.temp = temp;
+                            } catch (...) {}
+                        }
+                    } else if (thermal_zone >= 0) {
+                        std::string tz_path = "/sys/class/thermal/thermal_zone" + std::to_string(thermal_zone) + "/temp";
+                        std::ifstream tz_stream(tz_path);
+                        std::string temp_str;
+                        if (tz_stream.is_open() && std::getline(tz_stream, temp_str) && !temp_str.empty()) {
+                            try {
+                                int temp = std::stoi(temp_str);
+                                if (temp > 1000) temp /= 1000;
+                                gpu->metrics.temp = temp;
+                            } catch (...) {}
+                        }
+                    }
+
+                    // 读取 GPU 频率
+                    if (freq_stream.is_open()) {
+                        freq_stream.clear();
+                        freq_stream.seekg(0);
+                        std::string freq_str;
+                        if (std::getline(freq_stream, freq_str) && !freq_str.empty()) {
+                            try {
+                                double freq = std::stod(freq_str);
+                                if (freq > 1e7) freq /= 1e6;      // Hz -> MHz
+                                else if (freq > 1e4) freq /= 1e3; // KHz -> MHz
+                                gpu->metrics.CoreClock = (int)freq;
+                            } catch (...) {}
+                        }
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 }
             }).detach();
 

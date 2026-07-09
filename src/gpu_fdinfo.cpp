@@ -175,7 +175,7 @@ void GPU_fdinfo::find_hwmon_sensors()
 {
     std::string hwmon;
 
-    if (module == "msm")
+    if (module == "msm_drm" || module == "msm_dpu")
         hwmon = find_hwmon_sensor_dir("gpu");
     else if (module == "panfrost" || module == "panthor")
         hwmon = find_hwmon_sensor_dir("gpu_thermal");
@@ -371,7 +371,7 @@ int GPU_fdinfo::get_gpu_load()
 {
     if (module == "xe")
         return get_xe_load();
-    else if (module == "msm_drm")
+    else if (module == "msm_drm" || module == "msm_dpu")
         return get_kgsl_load();
 
     uint64_t now = os_time_get_nano();
@@ -709,7 +709,6 @@ void GPU_fdinfo::init_kgsl() {
         const char* load_paths[] = {
             "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
             "/sys/kernel/gpu/gpu_busy",
-            "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
             "/sys/class/kgsl/kgsl-3d0/devfreq/gpu_load",
             nullptr
         };
@@ -876,54 +875,62 @@ void GPU_fdinfo::main_thread()
         std::unique_lock<std::mutex> lock(metrics_mutex);
         cond_var.wait(lock, [this]() { return !paused || stop_thread; });
 
+        const bool is_msm = (module == "msm_drm" || module == "msm_dpu");
+
+        if (!is_msm) {
 #ifndef TEST_ONLY
-        if (HUDElements.g_gamescopePid > 0 && HUDElements.g_gamescopePid != pid)
-        {
-            pid = HUDElements.g_gamescopePid;
-            find_fd();
-        }
+            if (HUDElements.g_gamescopePid > 0 && HUDElements.g_gamescopePid != pid)
+            {
+                pid = HUDElements.g_gamescopePid;
+                find_fd();
+            }
 #endif
 
-        // Recheck fds every 10secs, fixes Mass Effect 1, maybe some others too
-        {
-            auto t = os_time_get_nano() / 1'000'000;
-            if (t - fdinfo_last_update_ms >= 10'000) {
-                find_fd();
-                fdinfo_last_update_ms = t;
+            // Recheck fds every 10secs, fixes Mass Effect 1, maybe some others too
+            {
+                auto t = os_time_get_nano() / 1'000'000;
+                if (t - fdinfo_last_update_ms >= 10'000) {
+                    find_fd();
+                    fdinfo_last_update_ms = t;
+                }
+            }
+
+            gather_fdinfo_data();
+            get_current_hwmon_readings();
+
+            metrics.load = get_gpu_load();
+            metrics.proc_vram_used = get_memory_used();
+
+            metrics.powerUsage = get_power_usage();
+            metrics.powerLimit = static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
+
+            metrics.CoreClock = get_gpu_clock();
+            metrics.voltage = hwmon_sensors["voltage"].val;
+
+            metrics.temp = hwmon_sensors["temp"].val / 1000.f;
+            metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
+
+            metrics.fan_speed = hwmon_sensors["fan_speed"].val;
+            metrics.fan_rpm = true;
+
+            int throttling = get_throttling_status();
+            metrics.is_power_throttled = throttling & GPU_throttle_status::POWER;
+            metrics.is_current_throttled = throttling & GPU_throttle_status::CURRENT;
+            metrics.is_temp_throttled = throttling & GPU_throttle_status::TEMP;
+            metrics.is_other_throttled = throttling & GPU_throttle_status::OTHER;
+        } else {
+            // msm_drm/msm_dpu: 使用 KGSL sysfs 读取数据
+            // 跳过 fdinfo/gather/hwmon/power/throttle 等无意义调用，避免性能浪费
+            metrics.load = get_gpu_load();
+            metrics.CoreClock = get_gpu_clock();
+            metrics.temp = get_kgsl_temp();
+            // kgsl 温度不可用时，尝试 hwmon 温度作为回退
+            if (metrics.temp == 0) {
+                get_current_hwmon_readings();
+                if (hwmon_sensors["temp"].val > 0)
+                    metrics.temp = hwmon_sensors["temp"].val / 1000.f;
             }
         }
-
-        gather_fdinfo_data();
-        get_current_hwmon_readings();
-
-        metrics.load = get_gpu_load();
-        metrics.proc_vram_used = get_memory_used();
-
-        metrics.powerUsage = get_power_usage();
-        metrics.powerLimit = static_cast<float>(hwmon_sensors["power_limit"].val) / 1'000'000;
-
-        metrics.CoreClock = get_gpu_clock();
-        metrics.voltage = hwmon_sensors["voltage"].val;
-
-        if (module == "msm_drm" || module == "msm_dpu") {
-            metrics.temp = get_kgsl_temp();
-            // 如果 kgsl 温度不可用，尝试 hwmon
-            if (metrics.temp == 0 && hwmon_sensors["temp"].val > 0)
-                metrics.temp = hwmon_sensors["temp"].val / 1000.f;
-        } else {
-            metrics.temp = hwmon_sensors["temp"].val / 1000.f;
-        }
-
-        metrics.memory_temp = hwmon_sensors["vram_temp"].val / 1000.f;
-
-        metrics.fan_speed = hwmon_sensors["fan_speed"].val;
-        metrics.fan_rpm = true; // Fan data is pulled from hwmon
-
-        int throttling = get_throttling_status();
-        metrics.is_power_throttled = throttling & GPU_throttle_status::POWER;
-        metrics.is_current_throttled = throttling & GPU_throttle_status::CURRENT;
-        metrics.is_temp_throttled = throttling & GPU_throttle_status::TEMP;
-        metrics.is_other_throttled = throttling & GPU_throttle_status::OTHER;
 
         SPDLOG_DEBUG(
             "pci_dev = {}, pid = {}, module = {}, "
