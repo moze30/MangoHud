@@ -178,7 +178,9 @@ endif
 
 link_args = cc.get_supported_link_arguments(['-Wl,-Bsymbolic-functions', '-Wl,-z,relro', '-Wl,--exclude-libs,ALL', '-lGL', '-static-libstdc++'])
 # meson fails to check version-script so just force add
-link_args += '-Wl,--version-script,@0@'.format(join_paths(meson.current_source_dir(), 'mangohud.version'))
+is_android = cc.get_define('__ANDROID__') != ''
+version_script = is_android ? 'mangohud.bionic.version' : 'mangohud.version'
+link_args += '-Wl,--version-script,@0@'.format(join_paths(meson.current_source_dir(), version_script))
 
 mangohud_static_lib = static_library(
   'MangoHud',

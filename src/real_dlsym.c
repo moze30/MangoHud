@@ -19,8 +19,22 @@ static bool print_dlsym;
 
 static void get_real_functions()
 {
+    int ret = 1;
+
+    print_dlopen = getenv("MANGOHUD_DEBUG_DLOPEN") != NULL;
+    print_dlsym = getenv("MANGOHUD_DEBUG_DLSYM") != NULL;
+
+#if defined(__ANDROID__)
+    /* bionic merges libdl into libc; dlopen/dlsym/dlerror are plain libc
+       exports and MangoHud does not interpose them in the layer-only setup. */
+    void *libc = dlopen("libc.so", RTLD_LAZY);
+    if (libc) {
+        __dlopen = (void *(*)(const char *, int)) dlsym(libc, "dlopen");
+        __dlsym = (void *(*)(void *, const char *)) dlsym(libc, "dlsym");
+        __dlerror = (char *(*)(void)) dlsym(libc, "dlerror");
+    }
+#else
     eh_obj_t libdl;
-    int ret;
 
     const char* libs[] = {
 #if defined(__GLIBC__)
@@ -30,9 +44,6 @@ static void get_real_functions()
         "*libc.*.so*",
         "*ld-musl-*.so*",
     };
-
-    print_dlopen = getenv("MANGOHUD_DEBUG_DLOPEN") != NULL;
-    print_dlsym = getenv("MANGOHUD_DEBUG_DLSYM") != NULL;
 
     for (size_t i = 0; i < sizeof(libs) / sizeof(*libs); i++)
     {
@@ -51,6 +62,7 @@ static void get_real_functions()
         __dlsym = NULL;
         __dlerror = NULL;
     }
+#endif
 
     if (!__dlopen && !__dlsym && !__dlerror)
     {

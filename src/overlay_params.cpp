@@ -6,7 +6,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 #include <wordexp.h>
 #include <unistd.h>
 #endif
@@ -392,6 +392,19 @@ parse_path(const char *str)
 #ifdef _XOPEN_SOURCE
    // Expand ~/ to home dir
    if (str[0] == '~') {
+#ifdef __ANDROID__
+      const char *home = getenv("HOME");
+      if (!home)
+         return str;
+      std::string s(home);
+      if (str[1] == '/')
+         s += (str + 1);
+      else if (str[1] == '\0')
+         {}
+      else
+         s += "/" + std::string(str + 1);
+      return s;
+#else
       std::stringstream s;
       wordexp_t e;
       int ret;
@@ -408,6 +421,7 @@ parse_path(const char *str)
 
       if (!ret)
          return s.str();
+#endif
    }
 #endif
    return str;

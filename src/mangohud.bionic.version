@@ -1,0 +1,8 @@
+# in base
+{
+  global:
+    overlay_GetInstanceProcAddr;
+    overlay_GetDeviceProcAddr;
+    vkNegotiateLoaderLayerInterfaceVersion;
+  local: *;
+};
