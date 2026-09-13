@@ -138,6 +138,8 @@ GPUS::GPUS(const overlay_params* early_params) {
                 int thermal_zone = -1;
                 bool use_gpubusy = false;
                 bool initialized = false;
+                int retry_count = 0;
+                constexpr int max_retries = 5;
 
                 while (true) {
                     auto gpu = weak.lock();
@@ -194,11 +196,18 @@ GPUS::GPUS(const overlay_params* early_params) {
                                 break;
                         }
 
-                        // 所有路径都不可用 → 退避 5 秒后重试（A8xx 场景）
+                        // 所有路径都不可用 → 退避 3 秒后重试（A8xx 场景）
                         if (!load_stream.is_open() && !temp_stream.is_open() &&
                             !freq_stream.is_open() && thermal_zone < 0) {
-                            SPDLOG_WARN("Adreno: KGSL sysfs 路径不可用，5 秒后重试");
-                            std::this_thread::sleep_for(std::chrono::seconds(5));
+                            retry_count++;
+                            if (retry_count >= max_retries) {
+                                // 连续多次无法检测到，永久静默，退出监控线程
+                                SPDLOG_WARN("Adreno: KGSL sysfs 路径不可用，已达最大重试次数，停止监控");
+                                return;
+                            }
+                            SPDLOG_WARN("Adreno: KGSL sysfs 路径不可用，3 秒后重试（{}/{}）",
+                                        retry_count, max_retries);
+                            std::this_thread::sleep_for(std::chrono::seconds(3));
                             load_stream.close();
                             temp_stream.close();
                             freq_stream.close();
